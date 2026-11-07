@@ -1,0 +1,1012 @@
+package routes
+
+import (
+	"crypto/rsa"
+	"encoding/base64"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net/http"
+	"net/url"
+	"strings"
+
+	pbDev "github.com/ayushdevan01/IDENTERA/proto/developer"
+	pbToken "github.com/ayushdevan01/IDENTERA/proto/token"
+	pbUser "github.com/ayushdevan01/IDENTERA/proto/user"
+	"github.com/ayushdevan01/IDENTERA/services/api-gateway/middleware"
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+type AuthRoutes struct {
+	devClient   pbDev.DeveloperServiceClient
+	userClient  pbUser.UserServiceClient
+	tokenClient pbToken.TokenServiceClient
+	appResolver *middleware.AppResolver
+	rateLimiter *middleware.AuthRateLimiter
+	issuer      string
+}
+
+func NewAuthRoutes(devClient pbDev.DeveloperServiceClient, userClient pbUser.UserServiceClient, tokenClient pbToken.TokenServiceClient, appResolver *middleware.AppResolver, rateLimiter *middleware.AuthRateLimiter, issuer string) *AuthRoutes {
+	if issuer == "" {
+		issuer = "https://auth.yourplatform.com"
+	}
+	return &AuthRoutes{
+		devClient:   devClient,
+		userClient:  userClient,
+		tokenClient: tokenClient,
+		appResolver: appResolver,
+		rateLimiter: rateLimiter,
+		issuer:      issuer,
+	}
+}
+
+func buildRedirectURLWithFragment(redirectURI string, values url.Values) string {
+	fragment := values.Encode()
+	if fragment == "" {
+		return redirectURI
+	}
+	return redirectURI + "#" + fragment
+}
+
+func parseRSAPublicKeyPEM(pemBytes []byte) (*rsa.PublicKey, error) {
+	pubKey, err := jwt.ParseRSAPublicKeyFromPEM(pemBytes)
+	if err == nil {
+		return pubKey, nil
+	}
+
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, err
+	}
+
+	rewrapped := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: block.Bytes,
+	})
+	return jwt.ParseRSAPublicKeyFromPEM(rewrapped)
+}
+
+func isAllowedRedirect(app *pbDev.App, redirectURI string) bool {
+	if app == nil || redirectURI == "" {
+		return false
+	}
+	for _, allowed := range app.RedirectUrls {
+		if allowed == redirectURI {
+			return true
+		}
+	}
+	return false
+}
+
+func (ar *AuthRoutes) getPublicApp(c *gin.Context, publicAppID string) (*pbDev.App, error) {
+	resp, err := ar.devClient.GetPublicApp(c.Request.Context(), &pbDev.GetPublicAppRequest{AppId: publicAppID})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Found || resp.App == nil {
+		return nil, fmt.Errorf("app not found")
+	}
+	return resp.App, nil
+}
+
+// GET /api/v1/public/apps/:app_id
+func (ar *AuthRoutes) PublicApp(c *gin.Context) {
+	appID := c.Param("app_id")
+	publicApp, err := ar.getPublicApp(c, appID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app_not_found"})
+		return
+	}
+
+	providersResp, err := ar.devClient.ListOAuthProviders(c.Request.Context(), &pbDev.ListOAuthProvidersRequest{
+		AppId:       publicApp.Id,
+		DeveloperId: publicApp.DeveloperId,
+	})
+	googleEnabled := false
+	githubEnabled := false
+	if err == nil {
+		for _, provider := range providersResp.Providers {
+			if !provider.Enabled || provider.ClientId == "" {
+				continue
+			}
+			switch provider.Provider {
+			case "google":
+				googleEnabled = true
+			case "github":
+				githubEnabled = true
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"name":   publicApp.Name,
+		"app_id": publicApp.AppId,
+		"auth_methods": gin.H{
+			"email":  publicApp.EmailAuthEnabled,
+			"google": googleEnabled,
+			"github": githubEnabled,
+		},
+		"require_email_verification": publicApp.RequireEmailVerification,
+	})
+}
+
+func (ar *AuthRoutes) requireEmailAuth(c *gin.Context, publicApp *pbDev.App) bool {
+	if publicApp == nil || !publicApp.EmailAuthEnabled {
+		c.JSON(http.StatusForbidden, gin.H{"error": "email_auth_disabled"})
+		return false
+	}
+	return true
+}
+
+// GET /oauth/authorize?app_id=xxx&provider=google&redirect_uri=...
+func (ar *AuthRoutes) Authorize(c *gin.Context) {
+	appID := c.Query("app_id")
+	provider := c.Query("provider")
+	redirectURI := c.Query("redirect_uri")
+
+	if appID == "" || provider == "" || redirectURI == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "app_id, provider, and redirect_uri are required"})
+		return
+	}
+
+	// TODO : add chaching for this
+	// appID -> WHOLE APP
+	// invalidate -> when app is updated or deleted
+	publicApp, err := ar.getPublicApp(c, appID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+	if !isAllowedRedirect(publicApp, redirectURI) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid redirect_uri"})
+		return
+	}
+
+	resolvedAppID, err := ar.appResolver.ResolveAppID(c, appID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	resp, err := ar.userClient.InitiateOAuth(c.Request.Context(), &pbUser.InitiateOAuthRequest{
+		AppId:       resolvedAppID,
+		Provider:    provider,
+		RedirectUri: redirectURI,
+		PublicAppId: publicApp.AppId,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initiate OAuth"})
+		return
+	}
+
+	c.Redirect(http.StatusFound, resp.AuthorizationUrl)
+}
+
+// GET /oauth/callback/:provider?code=xxx&state=xxx&code_verifier=...
+func (ar *AuthRoutes) Callback(c *gin.Context) {
+	provider := c.Param("provider")
+	code := c.Query("code")
+	state := c.Query("state")
+	if code == "" || state == "" {
+		// Check for error from provider
+		oauthErr := c.Query("error")
+		if oauthErr != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("OAuth error: %s", oauthErr)})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "code and state are required"})
+		return
+	}
+
+	// Handle OAuth callback → get user
+	callbackResp, err := ar.userClient.HandleOAuthCallback(c.Request.Context(), &pbUser.HandleOAuthCallbackRequest{
+		Provider: provider,
+		Code:     code,
+		State:    state,
+	})
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			msg := st.Message()
+			errorCode := "oauth_callback_failed"
+			redirectURI := ""
+			if parts := strings.SplitN(msg, "|", 2); len(parts) == 2 {
+				errorCode = parts[0]
+				redirectURI = parts[1]
+			} else if strings.HasPrefix(msg, "account_exists_use_original_provider") {
+				errorCode = "account_exists_use_original_provider"
+			} else if strings.HasPrefix(msg, "oauth_provider_mismatch") {
+				errorCode = "oauth_provider_mismatch"
+			} else if strings.HasPrefix(msg, "invalid_pkce_verifier") {
+				errorCode = "invalid_pkce_verifier"
+			}
+			if redirectURI != "" {
+				values := url.Values{}
+				values.Set("error", errorCode)
+				c.Redirect(http.StatusFound, buildRedirectURLWithFragment(redirectURI, values))
+				return
+			}
+			if st.Code() == codes.InvalidArgument {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errorCode})
+				return
+			}
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "OAuth callback failed"})
+		return
+	}
+
+	redirectURI := callbackResp.RedirectUri
+	redirectOAuthError := func(code string) {
+		if redirectURI == "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": code})
+			return
+		}
+		values := url.Values{}
+		values.Set("error", code)
+		c.Redirect(http.StatusFound, buildRedirectURLWithFragment(redirectURI, values))
+	}
+
+	// Create session
+	sessionResp, err := ar.userClient.CreateSession(c.Request.Context(), &pbUser.CreateSessionRequest{
+		UserId:     callbackResp.User.Id,
+		AppId:      callbackResp.AppId,
+		UserAgent:  c.Request.UserAgent(),
+		IpAddress:  c.ClientIP(),
+		TtlSeconds: 30 * 24 * 60 * 60, // 30 days
+	})
+	if err != nil {
+		redirectOAuthError("session_create_failed")
+		return
+	}
+
+	audience := callbackResp.PublicAppId
+	if audience == "" {
+		audience = callbackResp.AppId
+	}
+
+	// Generate token pair
+	tokenResp, err := ar.tokenClient.GenerateTokenPair(c.Request.Context(), &pbToken.GenerateTokenPairRequest{
+		AppId:           callbackResp.AppId,
+		UserId:          callbackResp.User.Id,
+		Email:           callbackResp.User.Email,
+		Provider:        provider,
+		EmailVerified:   callbackResp.User.EmailVerified,
+		SessionId:       sessionResp.Session.Id,
+		RefreshTokenTtl: 30 * 24 * 60 * 60,
+		Audience:        audience,
+	})
+	if err != nil {
+		redirectOAuthError("token_mint_failed")
+		return
+	}
+
+	refreshToken := tokenResp.RefreshToken
+	if refreshToken == "" {
+		refreshToken = sessionResp.RefreshToken
+	}
+
+	redirectValues := url.Values{}
+	redirectValues.Set("access_token", tokenResp.AccessToken)
+	redirectValues.Set("refresh_token", refreshToken)
+	redirectValues.Set("token_type", "Bearer")
+	redirectValues.Set("expires_at", fmt.Sprintf("%d", tokenResp.AccessTokenExpiresAt))
+	redirectURL := buildRedirectURLWithFragment(redirectURI, redirectValues)
+
+	c.Redirect(http.StatusFound, redirectURL)
+}
+
+// POST /oauth/refresh
+func (ar *AuthRoutes) RefreshTokens(c *gin.Context) {
+	var req struct {
+		RefreshToken       string `json:"refresh_token" binding:"required"`
+		AppID              string `json:"app_id" binding:"required"`
+		RotateRefreshToken bool   `json:"rotate_refresh_token"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	publicApp, err := ar.getPublicApp(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	resolvedAppID, err := ar.appResolver.ResolveAppID(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	resp, err := ar.tokenClient.RefreshTokens(c.Request.Context(), &pbToken.RefreshTokensRequest{
+		RefreshToken:       req.RefreshToken,
+		AppId:              resolvedAppID,
+		RotateRefreshToken: req.RotateRefreshToken,
+		Audience:           publicApp.AppId,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !resp.Success {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":      resp.ErrorCode,
+			"error_desc": resp.ErrorMessage,
+		})
+		return
+	}
+
+	result := gin.H{
+		"access_token": resp.AccessToken,
+		"token_type":   "Bearer",
+		"expires_at":   resp.AccessTokenExpiresAt,
+	}
+
+	if resp.RefreshToken != nil {
+		result["refresh_token"] = *resp.RefreshToken
+	}
+	if resp.RefreshTokenExpiresAt != nil {
+		result["refresh_token_expires_at"] = *resp.RefreshTokenExpiresAt
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// POST /oauth/revoke
+func (ar *AuthRoutes) RevokeToken(c *gin.Context) {
+	var req struct {
+		Token     string `json:"token" binding:"required"`
+		TokenType string `json:"token_type" binding:"required"` // "access" or "refresh"
+		AppID     string `json:"app_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	resolvedAppID, err := ar.appResolver.ResolveAppID(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	resp, err := ar.tokenClient.RevokeToken(c.Request.Context(), &pbToken.RevokeTokenRequest{
+		Token:     req.Token,
+		TokenType: req.TokenType,
+		AppId:     resolvedAppID,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": resp.Success})
+}
+
+// GET /api/v1/apps/:app_id/jwks
+func (ar *AuthRoutes) JWKS(c *gin.Context) {
+	appID := c.Param("app_id")
+	resolvedAppID, err := ar.appResolver.ResolveAppID(c, appID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	// TODO: Add caching for public keys
+	// app_id -> keys
+	resp, err := ar.tokenClient.GetPublicKeys(c.Request.Context(), &pbToken.GetPublicKeysRequest{
+		AppId: resolvedAppID,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	keys := make([]gin.H, 0, len(resp.Keys))
+	for _, k := range resp.Keys {
+		pubKey, err := parseRSAPublicKeyPEM([]byte(k.PublicKey))
+		if err != nil {
+			continue
+		}
+
+		keys = append(keys, gin.H{
+			"kid": k.Kid,
+			"kty": "RSA",
+			"alg": "RS256",
+			"use": "sig",
+			"n":   base64.RawURLEncoding.EncodeToString(pubKey.N.Bytes()),
+			"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pubKey.E)).Bytes()),
+		})
+	}
+
+	if len(keys) == 0 {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load valid public keys"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"keys": keys})
+}
+
+// POST /auth/register
+func (ar *AuthRoutes) Register(c *gin.Context) {
+	var req struct {
+		AppID           string `json:"app_id" binding:"required"`
+		Email           string `json:"email" binding:"required"`
+		Password        string `json:"password" binding:"required"`
+		ConfirmPassword string `json:"confirm_password"`
+		Name            string `json:"name"`
+		RedirectURI     string `json:"redirect_uri"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.ConfirmPassword != "" && req.ConfirmPassword != req.Password {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "password_mismatch"})
+		return
+	}
+	if ar.rateLimiter != nil {
+		ok, rlErr := ar.rateLimiter.AllowRegister(c.Request.Context(), req.AppID, c.ClientIP())
+		if rlErr == nil && !ok {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "rate_limited"})
+			return
+		}
+	}
+
+	publicApp, err := ar.getPublicApp(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+	if !ar.requireEmailAuth(c, publicApp) {
+		return
+	}
+
+	resolvedAppID, err := ar.appResolver.ResolveAppID(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	userResp, err := ar.userClient.RegisterWithEmail(c.Request.Context(), &pbUser.RegisterWithEmailRequest{
+		AppId:       resolvedAppID,
+		Email:       req.Email,
+		Password:    req.Password,
+		Name:        req.Name,
+		RedirectUri: req.RedirectURI,
+	})
+	if err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.InvalidArgument {
+			c.JSON(http.StatusBadRequest, gin.H{"error": st.Message()})
+			return
+		}
+		if st, ok := status.FromError(err); ok && st.Code() == codes.AlreadyExists {
+			c.JSON(http.StatusConflict, gin.H{"error": st.Message()})
+			return
+		}
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+
+	if publicApp.RequireEmailVerification {
+		c.JSON(http.StatusCreated, gin.H{
+			"verification_sent":     userResp.VerificationSent,
+			"requires_verification": true,
+			"message":               "account created, please verify your email before signing in",
+		})
+		return
+	}
+
+	if !isAllowedRedirect(publicApp, req.RedirectURI) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_redirect_uri"})
+		return
+	}
+
+	sessionResp, err := ar.userClient.CreateSession(c.Request.Context(), &pbUser.CreateSessionRequest{
+		UserId:     userResp.User.Id,
+		AppId:      resolvedAppID,
+		UserAgent:  c.Request.UserAgent(),
+		IpAddress:  c.ClientIP(),
+		TtlSeconds: 30 * 24 * 60 * 60,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
+		return
+	}
+
+	tokenResp, err := ar.tokenClient.GenerateTokenPair(c.Request.Context(), &pbToken.GenerateTokenPairRequest{
+		AppId:           resolvedAppID,
+		UserId:          userResp.User.Id,
+		Email:           userResp.User.Email,
+		Provider:        "email",
+		EmailVerified:   userResp.User.EmailVerified,
+		SessionId:       sessionResp.Session.Id,
+		RefreshTokenTtl: 30 * 24 * 60 * 60,
+		Audience:        publicApp.AppId,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate tokens"})
+		return
+	}
+
+	refreshToken := tokenResp.RefreshToken
+	if refreshToken == "" {
+		refreshToken = sessionResp.RefreshToken
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"access_token":             tokenResp.AccessToken,
+		"refresh_token":            refreshToken,
+		"token_type":               "Bearer",
+		"expires_at":               tokenResp.AccessTokenExpiresAt,
+		"refresh_token_expires_at": tokenResp.RefreshTokenExpiresAt,
+		"verification_sent":        userResp.VerificationSent,
+	})
+}
+
+// POST /auth/login
+func (ar *AuthRoutes) LoginWithEmail(c *gin.Context) {
+	var req struct {
+		AppID       string `json:"app_id" binding:"required"`
+		Email       string `json:"email" binding:"required"`
+		Password    string `json:"password" binding:"required"`
+		RedirectURI string `json:"redirect_uri"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	publicApp, err := ar.getPublicApp(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+	if !ar.requireEmailAuth(c, publicApp) {
+		return
+	}
+
+	if !isAllowedRedirect(publicApp, req.RedirectURI) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_redirect_uri"})
+		return
+	}
+
+	resolvedAppID, err := ar.appResolver.ResolveAppID(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	loginResp, err := ar.userClient.LoginWithEmail(c.Request.Context(), &pbUser.LoginWithEmailRequest{
+		AppId:                    resolvedAppID,
+		Email:                    req.Email,
+		Password:                 req.Password,
+		RequireEmailVerification: publicApp.RequireEmailVerification,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if !loginResp.Success {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":                 loginResp.ErrorMessage,
+			"requires_verification": loginResp.RequiresVerification,
+		})
+		return
+	}
+
+	sessionResp, err := ar.userClient.CreateSession(c.Request.Context(), &pbUser.CreateSessionRequest{
+		UserId:     loginResp.User.Id,
+		AppId:      resolvedAppID,
+		UserAgent:  c.Request.UserAgent(),
+		IpAddress:  c.ClientIP(),
+		TtlSeconds: 30 * 24 * 60 * 60,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
+		return
+	}
+
+	tokenResp, err := ar.tokenClient.GenerateTokenPair(c.Request.Context(), &pbToken.GenerateTokenPairRequest{
+		AppId:           resolvedAppID,
+		UserId:          loginResp.User.Id,
+		Email:           loginResp.User.Email,
+		Provider:        "email",
+		EmailVerified:   loginResp.User.EmailVerified,
+		SessionId:       sessionResp.Session.Id,
+		RefreshTokenTtl: 30 * 24 * 60 * 60,
+		Audience:        publicApp.AppId,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate tokens"})
+		return
+	}
+
+	refreshToken := tokenResp.RefreshToken
+	if refreshToken == "" {
+		refreshToken = sessionResp.RefreshToken
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"access_token":             tokenResp.AccessToken,
+		"refresh_token":            refreshToken,
+		"token_type":               "Bearer",
+		"expires_at":               tokenResp.AccessTokenExpiresAt,
+		"refresh_token_expires_at": tokenResp.RefreshTokenExpiresAt,
+	})
+}
+
+// POST /auth/forgot-password
+func (ar *AuthRoutes) ForgotPassword(c *gin.Context) {
+	var req struct {
+		AppID       string `json:"app_id" binding:"required"`
+		Email       string `json:"email" binding:"required"`
+		RedirectURI string `json:"redirect_uri"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if ar.rateLimiter != nil {
+		ok, rlErr := ar.rateLimiter.AllowForgotPassword(c.Request.Context(), req.AppID, c.ClientIP())
+		if rlErr == nil && !ok {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "rate_limited"})
+			return
+		}
+	}
+
+	publicApp, err := ar.getPublicApp(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+	if !ar.requireEmailAuth(c, publicApp) {
+		return
+	}
+
+	resolvedAppID, err := ar.appResolver.ResolveAppID(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	ar.userClient.ForgotPassword(c.Request.Context(), &pbUser.ForgotPasswordRequest{
+		AppId:       resolvedAppID,
+		Email:       req.Email,
+		RedirectUri: req.RedirectURI,
+	})
+
+	// Always return success regardless of whether email exists
+	c.JSON(http.StatusOK, gin.H{"message": "if an account with that email exists, a reset link has been sent"})
+}
+
+// POST /auth/reset-password
+func (ar *AuthRoutes) ResetPassword(c *gin.Context) {
+	var req struct {
+		AppID           string `json:"app_id" binding:"required"`
+		Token           string `json:"token" binding:"required"`
+		NewPassword     string `json:"new_password" binding:"required"`
+		ConfirmPassword string `json:"confirm_password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.ConfirmPassword != "" && req.ConfirmPassword != req.NewPassword {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "password_mismatch"})
+		return
+	}
+
+	publicApp, err := ar.getPublicApp(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+	if !ar.requireEmailAuth(c, publicApp) {
+		return
+	}
+
+	resolvedAppID, err := ar.appResolver.ResolveAppID(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	resp, err := ar.userClient.ResetPassword(c.Request.Context(), &pbUser.ResetPasswordRequest{
+		AppId:       resolvedAppID,
+		Token:       req.Token,
+		NewPassword: req.NewPassword,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if !resp.Success {
+		c.JSON(http.StatusBadRequest, gin.H{"error": resp.ErrorMessage})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "password reset successfully"})
+}
+
+// POST /auth/verify-email
+func (ar *AuthRoutes) VerifyEmail(c *gin.Context) {
+	var req struct {
+		AppID string `json:"app_id" binding:"required"`
+		Token string `json:"token" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	resolvedAppID, err := ar.appResolver.ResolveAppID(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	resp, err := ar.userClient.VerifyEmail(c.Request.Context(), &pbUser.VerifyEmailRequest{
+		AppId: resolvedAppID,
+		Token: req.Token,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if !resp.Success {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or expired verification link"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "email verified successfully", "user_id": resp.UserId})
+}
+
+// POST /api/v1/verify
+func (ar *AuthRoutes) VerifyToken(c *gin.Context) {
+	var req struct {
+		Token string `json:"token" binding:"required"`
+		AppID string `json:"app_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	resolvedAppID, err := ar.appResolver.ResolveAppID(c, req.AppID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	authenticatedAppID, ok := c.Get("api_key_app_id")
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "api key required"})
+		return
+	}
+	if authenticatedAppID.(string) != resolvedAppID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "app_id_mismatch"})
+		return
+	}
+
+	token, err := jwt.Parse(req.Token, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+
+		kid, ok := token.Header["kid"].(string)
+		if !ok {
+			return nil, fmt.Errorf("missing kid in token header")
+		}
+
+		// Fetch public keys from token service
+		resp, err := ar.tokenClient.GetPublicKeys(c.Request.Context(), &pbToken.GetPublicKeysRequest{
+			AppId: resolvedAppID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch public keys: %w", err)
+		}
+
+		// Find the matching key
+		for _, k := range resp.Keys {
+			if k.Kid == kid {
+				pubKey, err := parseRSAPublicKeyPEM([]byte(k.PublicKey))
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse public key: %w", err)
+				}
+				return pubKey, nil
+			}
+		}
+
+		return nil, fmt.Errorf("public key '%s' not found for app '%s'", kid, req.AppID)
+	}, jwt.WithIssuer(ar.issuer))
+
+	if err != nil || !token.Valid {
+		errMsg := "invalid token"
+		if err != nil {
+			errMsg = err.Error()
+		}
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"valid": false,
+			"error": errMsg,
+		})
+		return
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"valid": false, "error": "invalid token claims"})
+		return
+	}
+	aud, ok := extractStringClaim(claims["aud"])
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"valid": false, "error": "missing aud claim"})
+		return
+	}
+	// Accept publishable app id (current) or internal UUID (legacy tokens during rollout).
+	if aud != req.AppID && aud != resolvedAppID && aud != authenticatedAppID.(string) {
+		publicApp, pubErr := ar.getPublicApp(c, req.AppID)
+		if pubErr != nil || (aud != publicApp.AppId && aud != publicApp.Id) {
+			c.JSON(http.StatusUnauthorized, gin.H{"valid": false, "error": "audience mismatch"})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"valid":  true,
+		"claims": token.Claims,
+	})
+}
+
+func extractStringClaim(claim interface{}) (string, bool) {
+	switch value := claim.(type) {
+	case string:
+		if value == "" {
+			return "", false
+		}
+		return value, true
+	case []string:
+		if len(value) == 0 || value[0] == "" {
+			return "", false
+		}
+		return value[0], true
+	case []interface{}:
+		if len(value) == 0 {
+			return "", false
+		}
+		first, ok := value[0].(string)
+		if !ok || first == "" {
+			return "", false
+		}
+		return first, true
+	default:
+		return "", false
+	}
+}
+
+// GET /api/v1/userinfo
+func (ar *AuthRoutes) UserInfo(c *gin.Context) {
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authorization header required"})
+		return
+	}
+
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid authorization format, use: Bearer <token>"})
+		return
+	}
+
+	tokenString := parts[1]
+
+	token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token format"})
+		return
+	}
+
+	kid := ""
+	if kidVal, ok := token.Header["kid"].(string); ok {
+		kid = kidVal
+	}
+	if kid == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing kid in token header"})
+		return
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token claims"})
+		return
+	}
+
+	appID, ok := extractStringClaim(claims["aud"])
+	if !ok || appID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing aud (app_id) claim"})
+		return
+	}
+
+	userID, ok := claims["sub"].(string)
+	if !ok || userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing sub (user_id) claim"})
+		return
+	}
+
+	resolvedAppID, err := ar.appResolver.ResolveAppID(c, appID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app_id"})
+		return
+	}
+
+	resp, err := ar.tokenClient.GetPublicKeys(c.Request.Context(), &pbToken.GetPublicKeysRequest{
+		AppId: resolvedAppID,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch public keys"})
+		return
+	}
+
+	var pubKey interface{}
+	for _, k := range resp.Keys {
+		if k.Kid == kid {
+			pubKey, err = parseRSAPublicKeyPEM([]byte(k.PublicKey))
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse public key"})
+				return
+			}
+			break
+		}
+	}
+	if pubKey == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "public key not found"})
+		return
+	}
+
+	// Verify signature/issuer first, then accept publishable key or legacy internal UUID as aud.
+	verifiedToken, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		return pubKey, nil
+	}, jwt.WithIssuer(ar.issuer))
+
+	if err != nil || !verifiedToken.Valid {
+		errMsg := "invalid or expired token"
+		if err != nil {
+			errMsg = err.Error()
+		}
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsg})
+		return
+	}
+
+	publicApp, pubErr := ar.getPublicApp(c, appID)
+	if pubErr != nil {
+		// appID from aud may already be the internal UUID for legacy tokens.
+		publicApp, pubErr = ar.getPublicApp(c, resolvedAppID)
+	}
+	if pubErr != nil || publicApp == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid app audience"})
+		return
+	}
+	if appID != publicApp.AppId && appID != publicApp.Id && appID != resolvedAppID {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "audience mismatch"})
+		return
+	}
+
+	// Token is fully verified. Look up the user with the internal app UUID.
+	userResp, err := ar.userClient.GetUser(c.Request.Context(), &pbUser.GetUserRequest{
+		AppId:  resolvedAppID,
+		UserId: userID,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user profile: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"user": formatUser(userResp.User)})
+}

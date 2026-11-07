@@ -1,0 +1,201 @@
+package repository
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
+	"time"
+
+	"github.com/ayushdevan01/IDENTERA/services/developer-service/auth"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type SigningKey struct {
+	ID                  string
+	AppID               string
+	KID                 string
+	PublicKey           string
+	PrivateKeyEncrypted string
+	IsActive            bool
+	CreatedAt           time.Time
+	ExpiresAt           *time.Time
+	RotatedAt           *time.Time
+}
+
+type SigningKeyRepository struct {
+	db            *pgxpool.Pool
+	encryptionKey string
+}
+
+func NewSigningKeyRepository(db *pgxpool.Pool, encryptionKey string) *SigningKeyRepository {
+	return &SigningKeyRepository{db: db, encryptionKey: encryptionKey}
+}
+
+func generateRSAKeyPair() (string, string, error) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return "", "", err
+	}
+
+	privateKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	})
+
+	publicKeyBytes, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return "", "", err
+	}
+
+	publicKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: publicKeyBytes,
+	})
+
+	return string(publicKeyPEM), string(privateKeyPEM), nil
+}
+
+func generateKID() string {
+	return fmt.Sprintf("key-%d", time.Now().UnixNano())
+}
+
+func (r *SigningKeyRepository) Create(ctx context.Context, appID string) (*SigningKey, error) {
+	publicKey, privateKey, err := generateRSAKeyPair()
+	if err != nil {
+		return nil, err
+	}
+
+	privateKeyEncrypted, err := auth.Encrypt(privateKey, r.encryptionKey)
+	if err != nil {
+		return nil, err
+	}
+
+	kid := generateKID()
+	key := &SigningKey{}
+
+	err = r.db.QueryRow(ctx, `
+		INSERT INTO signing_keys (app_id, kid, public_key, private_key_encrypted, is_active)
+		VALUES ($1, $2, $3, $4, true)
+		RETURNING id, app_id, kid, public_key, private_key_encrypted, is_active, created_at, expires_at, rotated_at
+	`, appID, kid, publicKey, privateKeyEncrypted).Scan(
+		&key.ID, &key.AppID, &key.KID, &key.PublicKey, &key.PrivateKeyEncrypted, &key.IsActive, &key.CreatedAt, &key.ExpiresAt, &key.RotatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+func (r *SigningKeyRepository) GetActiveByAppID(ctx context.Context, appID string) (*SigningKey, error) {
+	key := &SigningKey{}
+	err := r.db.QueryRow(ctx, `
+		SELECT id, app_id, kid, public_key, private_key_encrypted, is_active, created_at, expires_at, rotated_at
+		FROM signing_keys
+		WHERE app_id = $1 AND is_active = true
+	`, appID).Scan(
+		&key.ID, &key.AppID, &key.KID, &key.PublicKey, &key.PrivateKeyEncrypted, &key.IsActive, &key.CreatedAt, &key.ExpiresAt, &key.RotatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+func (r *SigningKeyRepository) GetDecryptedPrivateKey(ctx context.Context, appID string) (string, error) {
+	key, err := r.GetActiveByAppID(ctx, appID)
+	if err != nil {
+		return "", err
+	}
+	return auth.Decrypt(key.PrivateKeyEncrypted, r.encryptionKey)
+}
+
+func (r *SigningKeyRepository) ListByAppID(ctx context.Context, appID string, includeExpired bool) ([]*SigningKey, error) {
+	query := `
+		SELECT id, app_id, kid, public_key, is_active, created_at, expires_at, rotated_at
+		FROM signing_keys WHERE app_id = $1
+	`
+	if !includeExpired {
+		query += ` AND (expires_at IS NULL OR expires_at > NOW())`
+	}
+	query += ` ORDER BY created_at DESC`
+
+	rows, err := r.db.Query(ctx, query, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []*SigningKey
+	for rows.Next() {
+		key := &SigningKey{}
+		err := rows.Scan(&key.ID, &key.AppID, &key.KID, &key.PublicKey, &key.IsActive, &key.CreatedAt, &key.ExpiresAt, &key.RotatedAt)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
+
+func (r *SigningKeyRepository) Rotate(ctx context.Context, appID string, gracePeriodHours int) (*SigningKey, *SigningKey, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	now := time.Now()
+	expiresAt := now.Add(time.Duration(gracePeriodHours) * time.Hour)
+
+	_, err = tx.Exec(ctx, `
+		UPDATE signing_keys SET is_active = false, rotated_at = $2, expires_at = $3
+		WHERE app_id = $1 AND is_active = true
+	`, appID, now, expiresAt)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	publicKey, privateKey, err := generateRSAKeyPair()
+	if err != nil {
+		return nil, nil, err
+	}
+	privateKeyEncrypted, err := auth.Encrypt(privateKey, r.encryptionKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	newKey := &SigningKey{}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO signing_keys (app_id, kid, public_key, private_key_encrypted, is_active)
+		VALUES ($1, $2, $3, $4, true)
+		RETURNING id, app_id, kid, public_key, private_key_encrypted, is_active, created_at, expires_at, rotated_at
+	`, appID, generateKID(), publicKey, privateKeyEncrypted).Scan(
+		&newKey.ID, &newKey.AppID, &newKey.KID, &newKey.PublicKey, &newKey.PrivateKeyEncrypted,
+		&newKey.IsActive, &newKey.CreatedAt, &newKey.ExpiresAt, &newKey.RotatedAt,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	oldKey := &SigningKey{}
+	err = r.db.QueryRow(ctx, `
+		SELECT id, app_id, kid, public_key, private_key_encrypted, is_active, created_at, expires_at, rotated_at
+		FROM signing_keys WHERE app_id = $1 AND id != $2 AND rotated_at IS NOT NULL
+		ORDER BY rotated_at DESC
+		LIMIT 1
+	`, appID, newKey.ID).Scan(
+		&oldKey.ID, &oldKey.AppID, &oldKey.KID, &oldKey.PublicKey, &oldKey.PrivateKeyEncrypted, &oldKey.IsActive, &oldKey.CreatedAt, &oldKey.ExpiresAt, &oldKey.RotatedAt,
+	)
+	if err != nil {
+		oldKey = nil
+	}
+
+	return newKey, oldKey, nil
+}

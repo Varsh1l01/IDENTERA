@@ -1,0 +1,279 @@
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+
+type AuthUser = {
+  sub?: string;
+  email?: string;
+  aud?: string | string[];
+  iss?: string;
+  exp?: number;
+  [key: string]: unknown;
+};
+
+type StoredSession = {
+  accessToken: string;
+  refreshToken?: string | null;
+  expiresAt?: string | null;
+  tokenType?: string | null;
+};
+
+type AuthContextValue = {
+  user: AuthUser | null;
+  isAuthenticated: boolean;
+  loading: boolean;
+  accessToken: string | null;
+  login: (options?: { redirectUri?: string; mode?: 'login' | 'register' }) => void;
+  logout: (options?: { redirectTo?: string }) => void;
+  getAccessToken: () => string | null;
+  refreshSession: () => Promise<string | null>;
+};
+
+type IdenteraProviderProps = {
+  appId: string;
+  authUrl: string;
+  redirectUri: string;
+  apiUrl?: string;
+  storageKey?: string;
+  children: React.ReactNode;
+};
+
+const AuthContext = createContext<AuthContextValue | null>(null);
+const REFRESH_SKEW_MS = 60_000;
+
+function storageSessionKey(storageKey: string) {
+  return `${storageKey}:session`;
+}
+
+function parseJwtPayload(token: string): AuthUser | null {
+  try {
+    const [, payload] = token.split('.');
+    if (!payload) return null;
+    const normalized = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const decoded = typeof window !== 'undefined' ? window.atob(normalized) : Buffer.from(normalized, 'base64').toString('utf8');
+    return JSON.parse(decoded) as AuthUser;
+  } catch {
+    return null;
+  }
+}
+
+function sessionExpiresAtMs(session: StoredSession | null): number | null {
+  if (!session?.accessToken) return null;
+  if (session.expiresAt) {
+    const expiresAt = Number(session.expiresAt);
+    if (!Number.isNaN(expiresAt)) return expiresAt * 1000;
+  }
+  const payload = parseJwtPayload(session.accessToken);
+  if (payload?.exp) return payload.exp * 1000;
+  return null;
+}
+
+function sessionExpired(session: StoredSession | null): boolean {
+  const expiresAt = sessionExpiresAtMs(session);
+  if (expiresAt == null) return !session?.accessToken;
+  return expiresAt <= Date.now();
+}
+
+function sessionNearExpiry(session: StoredSession | null): boolean {
+  const expiresAt = sessionExpiresAtMs(session);
+  if (expiresAt == null) return false;
+  return expiresAt - Date.now() <= REFRESH_SKEW_MS;
+}
+
+function readSession(storageKey: string): StoredSession | null {
+  if (typeof window === 'undefined') return null;
+  const raw = window.localStorage.getItem(storageSessionKey(storageKey));
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as StoredSession;
+  } catch {
+    return null;
+  }
+}
+
+function writeSession(storageKey: string, session: StoredSession | null) {
+  if (typeof window === 'undefined') return;
+  const key = storageSessionKey(storageKey);
+  if (!session) {
+    window.localStorage.removeItem(key);
+    return;
+  }
+  window.localStorage.setItem(key, JSON.stringify(session));
+}
+
+function resolveApiUrl(authUrl: string, apiUrl?: string) {
+  if (apiUrl) return apiUrl.replace(/\/$/, '');
+  if (typeof window !== 'undefined' && process.env.NEXT_PUBLIC_API_URL) {
+    return process.env.NEXT_PUBLIC_API_URL.replace(/\/$/, '');
+  }
+  try {
+    const parsed = new URL(authUrl);
+    if (parsed.port === '3001') {
+      parsed.port = '8080';
+    }
+    return parsed.origin;
+  } catch {
+    return 'http://localhost:8080';
+  }
+}
+
+export function IdenteraProvider({
+  appId,
+  authUrl,
+  redirectUri,
+  apiUrl,
+  storageKey = 'identera',
+  children,
+}: IdenteraProviderProps) {
+  const [session, setSession] = useState<StoredSession | null>(null);
+  const [loading, setLoading] = useState(true);
+  const resolvedApiUrl = useMemo(() => resolveApiUrl(authUrl, apiUrl), [authUrl, apiUrl]);
+  const refreshInFlight = useRef<Promise<string | null> | null>(null);
+
+  const applySession = useCallback((next: StoredSession | null) => {
+    writeSession(storageKey, next);
+    setSession(next);
+  }, [storageKey]);
+
+  const refreshSession = useCallback(async () => {
+    if (refreshInFlight.current) return refreshInFlight.current;
+
+    refreshInFlight.current = (async () => {
+      const current = readSession(storageKey);
+      if (!current?.refreshToken) return null;
+
+      try {
+        const response = await fetch(`${resolvedApiUrl}/oauth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            refresh_token: current.refreshToken,
+            app_id: appId,
+            rotate_refresh_token: true,
+          }),
+        });
+        if (!response.ok) {
+          applySession(null);
+          return null;
+        }
+        const data = await response.json();
+        const next: StoredSession = {
+          accessToken: data.access_token,
+          refreshToken: data.refresh_token || current.refreshToken,
+          tokenType: data.token_type || current.tokenType || 'Bearer',
+          expiresAt: data.expires_at != null ? String(data.expires_at) : current.expiresAt,
+        };
+        applySession(next);
+        return next.accessToken;
+      } catch {
+        return null;
+      } finally {
+        refreshInFlight.current = null;
+      }
+    })();
+
+    return refreshInFlight.current;
+  }, [appId, applySession, resolvedApiUrl, storageKey]);
+
+  useEffect(() => {
+    const existing = readSession(storageKey);
+    if (existing && sessionExpired(existing)) {
+      if (existing.refreshToken) {
+        void refreshSession().finally(() => setLoading(false));
+        return;
+      }
+      applySession(null);
+    } else if (existing) {
+      setSession(existing);
+    }
+    setLoading(false);
+  }, [applySession, refreshSession, storageKey]);
+
+  useEffect(() => {
+    if (!session?.refreshToken || sessionExpired(session) || !sessionNearExpiry(session)) return;
+    void refreshSession();
+  }, [refreshSession, session]);
+
+  const login = useCallback((options?: { redirectUri?: string; mode?: 'login' | 'register' }) => {
+    const target = new URL(authUrl);
+    target.searchParams.set('app_id', appId);
+    target.searchParams.set('redirect_uri', options?.redirectUri || redirectUri);
+    if (options?.mode) {
+      target.searchParams.set('mode', options.mode);
+    }
+    window.location.href = target.toString();
+  }, [appId, authUrl, redirectUri]);
+
+  const logout = useCallback((options?: { redirectTo?: string }) => {
+    const current = readSession(storageKey);
+    if (current?.refreshToken) {
+      void fetch(`${resolvedApiUrl}/oauth/revoke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: current.refreshToken,
+          token_type: 'refresh',
+          app_id: appId,
+        }),
+      }).catch(() => undefined);
+    }
+    applySession(null);
+    if (options?.redirectTo) {
+      window.location.href = options.redirectTo;
+    }
+  }, [appId, applySession, resolvedApiUrl, storageKey]);
+
+  const user = useMemo(() => {
+    if (!session?.accessToken || sessionExpired(session)) return null;
+    return parseJwtPayload(session.accessToken);
+  }, [session]);
+
+  const value = useMemo<AuthContextValue>(() => ({
+    user,
+    isAuthenticated: Boolean(session?.accessToken) && !sessionExpired(session),
+    loading,
+    accessToken: session?.accessToken || null,
+    login,
+    logout,
+    refreshSession,
+    getAccessToken: () => (session && !sessionExpired(session) ? session.accessToken : null),
+  }), [user, session, loading, login, logout, refreshSession]);
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+export function useAuth() {
+  const value = useContext(AuthContext);
+  if (!value) {
+    throw new Error('useAuth must be used inside IdenteraProvider');
+  }
+  return value;
+}
+
+export function AuthGuard({ children, fallback = null }: { children: React.ReactNode; fallback?: React.ReactNode }) {
+  const { isAuthenticated, loading } = useAuth();
+  if (loading) return <>{fallback}</>;
+  if (!isAuthenticated) return <>{fallback}</>;
+  return <>{children}</>;
+}
+
+export function AuthCallbackHandler({ storageKey = 'identera', onSuccess, fallback = null }: { storageKey?: string; onSuccess?: (session: StoredSession) => void; fallback?: React.ReactNode }) {
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const hash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+    const params = new URLSearchParams(hash);
+    const accessToken = params.get('access_token');
+    if (!accessToken) return;
+
+    const session: StoredSession = {
+      accessToken,
+      refreshToken: params.get('refresh_token'),
+      tokenType: params.get('token_type'),
+      expiresAt: params.get('expires_at'),
+    };
+
+    writeSession(storageKey, session);
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    onSuccess?.(session);
+  }, [storageKey, onSuccess]);
+
+  return <>{fallback}</>;
+}
